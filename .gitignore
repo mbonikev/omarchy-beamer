@@ -1,0 +1,3 @@
+# Scratch output from test/run.sh; the suites use mktemp, this is belt and braces.
+*.tmp
+.add.tmp.*

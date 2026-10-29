@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "beamer",
+  "name": "Project",
+  "version": "1.0.0",
+  "author": "kan",
+  "license": "MIT",
+  "description": "Project to a second screen: duplicate, extend, or use one screen only",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Project",
+    "description": "Duplicate, extend, or pick a single screen",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

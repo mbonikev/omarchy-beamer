@@ -1,0 +1,11 @@
+[
+ {"name":"DP-1","description":"Dell U2720Q","disabled":true,"focused":false,
+  "width":0,"height":0,"refreshRate":0,"scale":1.0,"transform":0,"x":0,"y":0,"mirrorOf":"none",
+  "availableModes":["2560x1440@60.00","1920x1080@60.00"]},
+ {"name":"HDMI-A-1","description":"Acme Projector","disabled":false,"focused":false,
+  "width":1920,"height":1080,"refreshRate":60.0,"scale":1.0,"transform":0,"x":0,"y":0,"mirrorOf":"none",
+  "availableModes":["1920x1080@60.00","1280x720@60.00"]},
+ {"name":"eDP-2","description":"Laptop panel","disabled":false,"focused":true,
+  "width":1920,"height":1080,"refreshRate":144.0,"scale":1.0,"transform":0,"x":1920,"y":0,"mirrorOf":"none",
+  "availableModes":["1920x1080@144.00"]}
+]

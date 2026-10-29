@@ -1,0 +1,5 @@
+[
+ {"name":"WL-1","description":"Nested Hyprland window","disabled":false,"focused":true,
+  "width":1280,"height":720,"refreshRate":60.0,"scale":1.0,"transform":0,"x":0,"y":0,"mirrorOf":"none",
+  "availableModes":["1280x720@60.00"]}
+]

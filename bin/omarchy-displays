@@ -1,0 +1,813 @@
+#!/bin/bash
+# omarchy-displays — the screen-arrangement engine behind the beamer plugin.
+# Omarchy shell plugin.
+#
+# Everything the panel does goes through this script. It keeps one declarative
+# layout document and renders it into a generated Hyprland Lua file inside
+# Omarchy's toggles directory, which hyprland.lua sources after
+# ~/.config/hypr/monitors.lua. That means:
+#
+#   * monitors.lua is never touched, and stays the fallback `reset` returns to
+#   * the layout survives `hyprctl reload`, logout, and reboot
+#   * the file name sorts last in the toggles directory, so it wins over the
+#     built-in internal-monitor-* toggles rather than racing them
+#
+# Output names reach generated Lua, so every one is validated against a plain
+# connector pattern first — a headless output can carry an arbitrary name.
+
+set -uo pipefail
+
+STATE_DIR="$HOME/.local/state/omarchy/display-layout"
+LAYOUT="$STATE_DIR/layout.json"
+PROFILE_DIR="$HOME/.config/omarchy/display-profiles"
+TOGGLES_DIR="$HOME/.local/state/omarchy/toggles/hypr"
+# zz- so sorted require order puts this after internal-monitor-*.lua.
+GENERATED="$TOGGLES_DIR/zz-display-layout.lua"
+CLAMSHELL_FLAG="$TOGGLES_DIR/internal-monitor-clamshell.lua"
+
+INTERNAL_RE='^(eDP|LVDS|DSI)-'
+# Outputs that are not a monitor anyone can see: Hyprland's `output create`
+# virtuals (HEADLESS-n) and the windows a nested Hyprland renders into
+# (WL-n, X11-n). Arranging around one of these moves the real desktop next to
+# a screen that does not exist, so they are filtered out of every query.
+# Set OMARCHY_DISPLAYS_INCLUDE_VIRTUAL=1 to manage them anyway.
+VIRTUAL_RE='^(HEADLESS|WL|X11)-'
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+notify() {
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send -g 󰍹 "$1" >/dev/null 2>&1 || true
+  fi
+}
+
+valid_output() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+require_output() {
+  local name="$1"
+  [[ -n $name ]] || die "Missing monitor name"
+  valid_output "$name" || die "Refusing unsafe monitor name: $name"
+}
+
+valid_number() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+
+# Arranging is only meaningful with something to arrange against. With one
+# monitor these commands would take the config over from monitors.lua and
+# change nothing, so they decline instead.
+require_two() {
+  local connected
+  connected=$(hw | jq -r 'length')
+  (( connected >= 2 )) && return 0
+  die "$1 needs a second monitor connected (found $connected)"
+}
+
+# ---------------------------------------------------------------- hardware
+
+# OMARCHY_DISPLAYS_HW_JSON lets the test suite stand in a fake monitor set, so
+# multi-head arrangement can be checked without plugging anything in.
+hw() {
+  if [[ -n ${OMARCHY_DISPLAYS_HW_JSON:-} ]]; then
+    printf '%s\n' "$OMARCHY_DISPLAYS_HW_JSON" | drop_virtual
+    return
+  fi
+  # hyprctl can exit 0 and still print nothing — Hyprland not up yet, or an
+  # IPC hiccup. Validate the payload rather than trusting the status, so a
+  # blank reply degrades to "no monitors" instead of a jq error.
+  local raw
+  raw=$(hyprctl monitors all -j 2>/dev/null)
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$raw" || raw='[]'
+  printf '%s\n' "$raw" | drop_virtual
+}
+
+# Strip virtual outputs from a monitor array on stdin. If that would leave
+# nothing at all, pass the list through untouched: a session running entirely
+# nested or headless should still be manageable rather than seeing no screens.
+drop_virtual() {
+  if [[ ${OMARCHY_DISPLAYS_INCLUDE_VIRTUAL:-0} == 1 ]]; then
+    cat
+    return
+  fi
+  jq --arg re "$VIRTUAL_RE" '
+    (map(select((.name | test($re)) | not))) as $real
+    | if ($real | length) > 0 or (length == 0) then $real else . end'
+}
+
+# name<TAB>enabled<TAB>width<TAB>height<TAB>refresh<TAB>scale<TAB>transform<TAB>description
+hw_rows() {
+  hw | jq -r '.[] | [
+    .name,
+    (if .disabled == true then "0" else "1" end),
+    (.width // 0 | tostring),
+    (.height // 0 | tostring),
+    ((.refreshRate // 0) | tostring),
+    ((.scale // 1) | tostring),
+    ((.transform // 0) | tostring),
+    (.description // "")
+  ] | @tsv'
+}
+
+connected_names() { hw | jq -r '.[].name' | sort; }
+
+# ------------------------------------------------------------------ layout
+
+default_layout() {
+  cat <<'JSON'
+{
+  "version": 1,
+  "mode": "extend",
+  "axis": "horizontal",
+  "align": "top",
+  "order": [],
+  "primary": "",
+  "mirrorSource": "",
+  "outputs": {}
+}
+JSON
+}
+
+# Load the layout, creating it on first use, then reconcile it with the
+# hardware: new outputs get a default entry and join the order, outputs that
+# were unplugged keep their entry (so reconnecting restores their settings)
+# but drop out of the live order.
+layout_load() {
+  mkdir -p "$STATE_DIR"
+  [[ -f $LAYOUT ]] || default_layout >"$LAYOUT"
+
+  local doc names
+  doc=$(<"$LAYOUT")
+  jq -e . >/dev/null 2>&1 <<<"$doc" || doc=$(default_layout)
+
+  names=$(connected_names | jq -R . | jq -s .)
+
+  # Scale and rotation are not part of what this plugin arranges, but every
+  # generated monitor rule has to state them. Seed a new output from what the
+  # compositor is already doing, so taking over an arrangement never quietly
+  # resets a scale set in monitors.lua.
+  local live
+  live=$(hw | jq -c '[.[] | { key: .name, value: {
+      scale: ((((.scale // 1) * 100) | round) / 100),
+      transform: (.transform // 0)
+    } }] | from_entries')
+
+  jq --argjson connected "$names" --argjson live "$live" '
+    def defaults($n): {
+      enabled: true,
+      mode: "preferred",
+      scale: (($live[$n].scale) // 1),
+      transform: (($live[$n].transform) // 0),
+      position: null
+    };
+    .outputs = (reduce $connected[] as $n (.outputs; .[$n] = (defaults($n) + (.[$n] // {}))))
+    # Keep the stored order for still-connected outputs, append newcomers,
+    # then de-duplicate while preserving that order.
+    | .order = (
+        (((.order // []) | map(select(. as $o | $connected | index($o)))) + $connected)
+        | reduce .[] as $o ([]; if index($o) then . else . + [$o] end)
+      )
+    | .primary = (if (.primary // "") as $p | ($connected | index($p)) then .primary
+                  else ((.order // []) | .[0] // "") end)
+  ' <<<"$doc"
+}
+
+# Replace the layout with the given JSON. Takes the document as an argument
+# rather than on stdin so it is never the tail of a pipeline: a `die` in a
+# pipeline element only kills that subshell, which would let a rejected edit
+# report success.
+layout_replace() {
+  local next="$1"
+  [[ -n $next ]] || die "Refusing to save an empty layout"
+  jq -e . >/dev/null 2>&1 <<<"$next" || die "Refusing to save an invalid layout"
+
+  mkdir -p "$STATE_DIR"
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.layout.XXXXXX") || die "Cannot write layout"
+  printf '%s\n' "$next" >"$tmp" || { rm -f "$tmp"; die "Cannot write layout"; }
+  mv "$tmp" "$LAYOUT"
+}
+
+# Apply a jq program to the layout, then re-render and reload.
+layout_edit() {
+  local program="$1"; shift
+  local next
+  next=$(layout_load | jq "$@" "$program") || exit 1
+  layout_replace "$next"
+  apply
+}
+
+# ------------------------------------------------------------- measurement
+
+# Logical size of an output under its configured mode/scale/transform.
+# Echoes "<w> <h>". Falls back to the live mode, then to 1920x1080, so a
+# "preferred" entry still yields a usable position for its neighbours.
+logical_size() {
+  local name="$1" mode="$2" scale="$3" transform="$4"
+  local w h
+
+  if [[ $mode =~ ^([0-9]+)x([0-9]+)(@.*)?$ ]]; then
+    w="${BASH_REMATCH[1]}"; h="${BASH_REMATCH[2]}"
+  else
+    read -r w h < <(hw | jq -r --arg n "$name" '
+      [.[] | select(.name == $n)][0]
+      | if . == null then "0 0"
+        elif (.width // 0) > 0 then "\(.width) \(.height)"
+        else ((.availableModes // [])[0] // "")
+             | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)") // {w:"0",h:"0"}
+             | "\(.w) \(.h)"
+        end')
+    [[ ${w:-0} -gt 0 ]] || { w=1920; h=1080; }
+  fi
+
+  valid_number "$scale" && (( $(awk -v s="$scale" 'BEGIN{print (s > 0)}') )) || scale=1
+
+  # Transforms 1/3/5/7 are the 90°/270° families and swap the axes.
+  case "$transform" in
+    1|3|5|7) local t="$w"; w="$h"; h="$t" ;;
+  esac
+
+  awk -v w="$w" -v h="$h" -v s="$scale" 'BEGIN{
+    printf "%d %d\n", int(w / s + 0.5), int(h / s + 0.5)
+  }'
+}
+
+# ---------------------------------------------------------------- rendering
+
+# Outputs that take part in the arrangement: enabled, connected, and not a
+# mirror target.
+render() {
+  local doc="$1"
+  local mode axis align primary mirror_source
+  mode=$(jq -r '.mode' <<<"$doc")
+  axis=$(jq -r '.axis' <<<"$doc")
+  align=$(jq -r '.align // "top"' <<<"$doc")
+  primary=$(jq -r '.primary // ""' <<<"$doc")
+  mirror_source=$(jq -r '.mirrorSource // ""' <<<"$doc")
+
+  # Lid closed with an external attached: the clamshell watcher owns the
+  # internal panel. Leave it out entirely rather than fighting it on a loop.
+  local skip_internal=""
+  if [[ -f $CLAMSHELL_FLAG ]]; then
+    skip_internal=$(hw | jq -r --arg re "$INTERNAL_RE" '[.[] | select(.name | test($re))][0].name // ""')
+  fi
+
+  printf -- '-- Generated by omarchy-displays (beamer plugin). Do not edit.\n'
+  printf -- '-- Layout: %s\n' "$STATE_DIR/layout.json"
+  printf -- '-- Remove with: omarchy-displays reset\n\n'
+
+  local enabled_order=()
+  local name
+  while read -r name; do
+    [[ -n $name ]] || continue
+    [[ $name == "$skip_internal" ]] && continue
+    enabled_order+=("$name")
+  done < <(jq -r '.order[] as $o | select(.outputs[$o].enabled == true) | $o' <<<"$doc")
+
+  # In mirror mode the source drives its own mode and every other enabled
+  # output clones it. Hyprland ignores position on a mirror, so only the
+  # source gets one.
+  if [[ $mode == mirror ]]; then
+    local source="$mirror_source"
+    [[ -n $source ]] || source="${enabled_order[0]:-}"
+    if [[ -z $source ]]; then
+      printf -- '-- No enabled outputs to mirror.\n'
+      return 0
+    fi
+
+    emit_rule "$doc" "$source" "0x0"
+    for name in "${enabled_order[@]}"; do
+      [[ $name == "$source" ]] && continue
+      printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1, mirror = "%s" })\n' \
+        "$name" "$source"
+    done
+  else
+    # Extend: walk the order accumulating along the chosen axis. An output
+    # with an explicit position keeps it and does not advance the cursor,
+    # so manual placement and automatic packing can coexist.
+    local cursor=0 total_cross=0
+    local -a autos=()
+    local -A sizes_w=() sizes_h=()
+
+    for name in "${enabled_order[@]}"; do
+      local o_mode o_scale o_transform w h
+      o_mode=$(jq -r --arg n "$name" '.outputs[$n].mode // "preferred"' <<<"$doc")
+      o_scale=$(jq -r --arg n "$name" '.outputs[$n].scale // 1' <<<"$doc")
+      o_transform=$(jq -r --arg n "$name" '.outputs[$n].transform // 0' <<<"$doc")
+      read -r w h < <(logical_size "$name" "$o_mode" "$o_scale" "$o_transform")
+      sizes_w["$name"]=$w
+      sizes_h["$name"]=$h
+
+      if [[ $(jq -r --arg n "$name" '.outputs[$n].position // "null"' <<<"$doc") == null ]]; then
+        autos+=("$name")
+        if [[ $axis == vertical ]]; then
+          (( total_cross = w > total_cross ? w : total_cross ))
+        else
+          (( total_cross = h > total_cross ? h : total_cross ))
+        fi
+      fi
+    done
+
+    for name in "${enabled_order[@]}"; do
+      local position
+      position=$(jq -r --arg n "$name" '.outputs[$n].position // "null"' <<<"$doc")
+
+      if [[ $position != null ]]; then
+        [[ $position =~ ^-?[0-9]+x-?[0-9]+$ ]] || position="0x0"
+        emit_rule "$doc" "$name" "$position"
+        continue
+      fi
+
+      local w=${sizes_w[$name]} h=${sizes_h[$name]}
+      local x y cross
+      if [[ $axis == vertical ]]; then
+        cross=$(cross_offset "$align" "$total_cross" "$w")
+        x=$cross; y=$cursor
+        (( cursor += h ))
+      else
+        cross=$(cross_offset "$align" "$total_cross" "$h")
+        x=$cursor; y=$cross
+        (( cursor += w ))
+      fi
+      emit_rule "$doc" "$name" "${x}x${y}"
+    done
+  fi
+
+  # Disabled outputs are stated explicitly so a reload turns them off.
+  while read -r name; do
+    [[ -n $name ]] || continue
+    [[ $name == "$skip_internal" ]] && continue
+    printf 'hl.monitor({ output = "%s", disabled = true })\n' "$name"
+  done < <(jq -r '.order[] as $o | select(.outputs[$o].enabled != true) | $o' <<<"$doc")
+
+  if [[ -n $primary ]]; then
+    printf '\n-- Primary display: %s\n' "$primary"
+  fi
+}
+
+cross_offset() {
+  local align="$1" total="$2" size="$3"
+  case "$align" in
+    center) awk -v t="$total" -v s="$size" 'BEGIN{ o = int((t - s) / 2); print (o > 0 ? o : 0) }' ;;
+    end)    awk -v t="$total" -v s="$size" 'BEGIN{ o = t - s; print (o > 0 ? o : 0) }' ;;
+    *)      printf '0\n' ;;
+  esac
+}
+
+emit_rule() {
+  local doc="$1" name="$2" position="$3"
+  local mode scale transform
+  mode=$(jq -r --arg n "$name" '.outputs[$n].mode // "preferred"' <<<"$doc")
+  scale=$(jq -r --arg n "$name" '.outputs[$n].scale // 1' <<<"$doc")
+  transform=$(jq -r --arg n "$name" '.outputs[$n].transform // 0' <<<"$doc")
+
+  [[ $mode == preferred || $mode =~ ^[0-9]+x[0-9]+(@[0-9]+([.][0-9]+)?)?$ ]] || mode="preferred"
+  valid_number "$scale" || scale=1
+  [[ $transform =~ ^[0-7]$ ]] || transform=0
+
+  printf 'hl.monitor({ output = "%s", mode = "%s", position = "%s", scale = %s, transform = %s })\n' \
+    "$name" "$mode" "$position" "$scale" "$transform"
+}
+
+# ----------------------------------------------------------------- applying
+
+apply() {
+  local doc out
+  doc=$(layout_load)
+  out=$(render "$doc") || die "Failed to render layout"
+
+  mkdir -p "$TOGGLES_DIR"
+  printf '%s\n' "$out" >"$GENERATED"
+
+  # The built-in laptop toggles write monitor rules of their own. Once this
+  # plugin owns the layout, leaving them in place means two authorities for
+  # the same output, so stand them down (the panel is now the way to turn the
+  # internal panel off).
+  rm -f "$TOGGLES_DIR/internal-monitor-disable.lua" \
+        "$TOGGLES_DIR/internal-monitor-mirror.lua"
+
+  hyprctl reload >/dev/null 2>&1 || true
+}
+
+cmd_reset() {
+  rm -f "$GENERATED" "$LAYOUT"
+  hyprctl reload >/dev/null 2>&1 || true
+  notify "Display layout reset to monitors.lua"
+}
+
+# ------------------------------------------------------------------ queries
+
+cmd_state() {
+  local doc
+  doc=$(layout_load)
+
+  local profiles
+  profiles=$(
+    if [[ -d $PROFILE_DIR ]]; then
+      find "$PROFILE_DIR" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null |
+        sed 's/\.json$//' | sort | jq -R . | jq -s .
+    else
+      echo '[]'
+    fi
+  )
+
+  hw | jq \
+    --argjson layout "$doc" \
+    --argjson profiles "$profiles" \
+    --arg generated "$(if [[ -f $GENERATED ]]; then echo true; else echo false; fi)" \
+    --arg internalRe "$INTERNAL_RE" '
+    def internal: test($internalRe);
+    {
+      managed: ($generated == "true"),
+      mode: $layout.mode,
+      axis: $layout.axis,
+      align: ($layout.align // "top"),
+      primary: ($layout.primary // ""),
+      mirrorSource: ($layout.mirrorSource // ""),
+      order: ($layout.order // []),
+      profiles: $profiles,
+      displays: [
+        ($layout.order // [])[] as $n
+        | ([.[] | select(.name == $n)][0] // {}) as $m
+        | {
+            name: $n,
+            description: ($m.description // ""),
+            model: ($m.model // ""),
+            internal: ($n | internal),
+            focused: (($m.focused // false) == true),
+            live: {
+              enabled: (($m.disabled // false) != true),
+              width: ($m.width // 0),
+              height: ($m.height // 0),
+              refresh: (($m.refreshRate // 0) * 100 | round / 100),
+              scale: ($m.scale // 1),
+              transform: ($m.transform // 0),
+              x: ($m.x // 0),
+              y: ($m.y // 0),
+              mirrorOf: ($m.mirrorOf // "none")
+            },
+            wanted: ($layout.outputs[$n] // {}),
+            modes: ([($m.availableModes // [])[]
+                     | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)")
+                     | { value: "\(.w)x\(.h)@\(.r)",
+                         label: "\(.w)×\(.h) @ \((.r | tonumber | round))Hz",
+                         width: (.w | tonumber), height: (.h | tonumber),
+                         refresh: (.r | tonumber) }]
+                    | unique_by(.value)
+                    | sort_by(-.width, -.height, -.refresh))
+          }
+      ]
+    }
+    | .enabledCount = ([.displays[] | select(.wanted.enabled == true)] | length)
+    | .connectedCount = (.displays | length)
+  '
+}
+
+cmd_render() { render "$(layout_load)"; }
+
+# ----------------------------------------------------------------- mutators
+
+cmd_mirror() {
+  require_two "Mirroring"
+  local source="${1:-}"
+  local doc next
+  doc=$(layout_load)
+
+  if [[ -z $source ]]; then
+    # Prefer the focused output, then the primary, then the first enabled one.
+    source=$(hw | jq -r '[.[] | select(.focused == true and .disabled != true)][0].name // ""')
+    [[ -n $source ]] || source=$(jq -r '.primary // ""' <<<"$doc")
+    [[ -n $source ]] || source=$(jq -r '.order[0] // ""' <<<"$doc")
+  fi
+  require_output "$source"
+
+  jq -e --arg n "$source" '.outputs | has($n)' >/dev/null <<<"$doc" \
+    || die "Not a connected monitor: $source"
+
+  local count
+  count=$(jq -r '[.order[] as $o | select(.outputs[$o].enabled == true)] | length' <<<"$doc")
+  (( count >= 2 )) || die "Mirroring needs at least two enabled monitors (have $count)"
+
+  next=$(jq --arg n "$source" '.mode = "mirror" | .mirrorSource = $n | .primary = $n' <<<"$doc") || exit 1
+  layout_replace "$next"
+  apply
+  notify "Mirroring $source to all displays"
+}
+
+cmd_extend() {
+  require_two "Extending"
+  local direction="${1:-right}"
+  local doc axis next
+  doc=$(layout_load)
+
+  case "$direction" in
+    right|left) axis=horizontal ;;
+    down|below|up|above) axis=vertical ;;
+    *) die "Usage: omarchy-displays extend <right|left|up|down>" ;;
+  esac
+
+  local primary
+  primary=$(jq -r '.primary // ""' <<<"$doc")
+  [[ -n $primary ]] || primary=$(jq -r '.order[0] // ""' <<<"$doc")
+  [[ -n $primary ]] || die "No connected monitors"
+
+  # The primary leads the order when extending right/down and trails it when
+  # extending left/up, which is what "put the other screen on my left" means.
+  local lead=true
+  case "$direction" in left|up|above) lead=false ;; esac
+
+  next=$(jq --arg axis "$axis" --arg primary "$primary" --argjson lead "$lead" '
+    (.order | map(select(. != $primary))) as $rest
+    | .mode = "extend"
+    | .axis = $axis
+    | .mirrorSource = ""
+    | .order = (if $lead then [$primary] + $rest else $rest + [$primary] end)
+    | .outputs |= with_entries(.value.position = null)
+  ' <<<"$doc") || exit 1
+  layout_replace "$next"
+  apply
+  notify "Extended displays ($direction of $primary)"
+}
+
+cmd_arrange() {
+  require_two "Arranging"
+  local axis=horizontal
+  local -a wanted=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --vertical) axis=vertical ;;
+      --horizontal) axis=horizontal ;;
+      *) require_output "$arg"; wanted+=("$arg") ;;
+    esac
+  done
+  (( ${#wanted[@]} >= 1 )) || die "Usage: omarchy-displays arrange [--vertical] <monitor> [monitor...]"
+
+  local doc list missing next
+  doc=$(layout_load)
+  list=$(printf '%s\n' "${wanted[@]}" | jq -R . | jq -s .)
+
+  missing=$(jq -r --argjson want "$list" '[$want[] | select(. as $n | ($outputs | has($n)) | not)] | join(", ")' \
+    --argjson outputs "$(jq '.outputs' <<<"$doc")" <<<'{}')
+  [[ -z $missing ]] || die "Not connected: $missing"
+
+  # The named monitors lead in the given order; anything else keeps its
+  # relative place behind them.
+  next=$(jq --argjson want "$list" --arg axis "$axis" '
+    .mode = "extend"
+    | .axis = $axis
+    | .mirrorSource = ""
+    | .order = ($want + (.order | map(select(. as $o | ($want | index($o)) == null))))
+    | .outputs |= with_entries(.value.position = null)
+  ' <<<"$doc") || exit 1
+  layout_replace "$next"
+  apply
+  notify "Arranged: $(printf '%s ' "${wanted[@]}")"
+}
+
+cmd_only() {
+  require_two "Showing one display"
+  local keep="${1:-}"
+  require_output "$keep"
+  local doc next
+  doc=$(layout_load)
+  jq -e --arg n "$keep" '.outputs | has($n)' >/dev/null <<<"$doc" \
+    || die "Not a connected monitor: $keep"
+
+  next=$(jq --arg n "$keep" '
+    .mode = "extend" | .mirrorSource = "" | .primary = $n
+    | .outputs |= with_entries(.value.enabled = (.key == $n) | .value.position = null)
+  ' <<<"$doc") || exit 1
+  layout_replace "$next"
+  apply
+  notify "Showing $keep only"
+}
+
+cmd_enable() {
+  local name="${1:-}" want="${2:-on}"
+  require_output "$name"
+  local doc
+  doc=$(layout_load)
+  jq -e --arg n "$name" '.outputs | has($n)' >/dev/null <<<"$doc" \
+    || die "Not a connected monitor: $name"
+
+  local current enabled next
+  current=$(jq -r --arg n "$name" '.outputs[$n].enabled' <<<"$doc")
+  case "$want" in
+    on) enabled=true ;;
+    off) enabled=false ;;
+    toggle) enabled=$([[ $current == true ]] && echo false || echo true) ;;
+    *) die "Usage: omarchy-displays enable <monitor> [on|off|toggle]" ;;
+  esac
+
+  if [[ $enabled == false ]]; then
+    local remaining
+    remaining=$(jq -r --arg n "$name" '[.order[] as $o | select(.outputs[$o].enabled == true and $o != $n)] | length' <<<"$doc")
+    (( remaining >= 1 )) || die "Can't disable the only active display"
+  fi
+
+  next=$(jq --arg n "$name" --argjson e "$enabled" '
+    .outputs[$n].enabled = $e
+    | if ($e | not) and .primary == $n
+      then .primary = ([.order[] as $o | select(.outputs[$o].enabled == true)][0] // "")
+      else . end
+    | if ($e | not) and .mirrorSource == $n then .mode = "extend" | .mirrorSource = "" else . end
+  ' <<<"$doc") || exit 1
+  layout_replace "$next"
+  apply
+  notify "$name $([[ $enabled == true ]] && echo enabled || echo disabled)"
+}
+
+cmd_mode() {
+  local name="${1:-}" mode="${2:-}"
+  require_output "$name"
+  [[ $mode == preferred || $mode =~ ^[0-9]+x[0-9]+(@[0-9]+([.][0-9]+)?)?$ ]] \
+    || die "Usage: omarchy-displays mode <monitor> <WIDTHxHEIGHT[@HZ]|preferred>"
+
+  layout_edit '
+    if (.outputs | has($n)) | not then error("Not a connected monitor: " + $n) else . end
+    | .outputs[$n].mode = $m
+  ' --arg n "$name" --arg m "$mode"
+  notify "$name set to $mode"
+}
+
+cmd_scale() {
+  local name="${1:-}" scale="${2:-}"
+  require_output "$name"
+  valid_number "$scale" || die "Usage: omarchy-displays scale <monitor> <number>"
+  (( $(awk -v s="$scale" 'BEGIN{print (s >= 0.5 && s <= 4)}') )) || die "Scale must be between 0.5 and 4"
+
+  layout_edit '
+    if (.outputs | has($n)) | not then error("Not a connected monitor: " + $n) else . end
+    | .outputs[$n].scale = ($s | tonumber)
+  ' --arg n "$name" --arg s "$scale"
+  notify "$name scale $scale"
+}
+
+cmd_transform() {
+  local name="${1:-}" transform="${2:-}"
+  require_output "$name"
+  case "$transform" in
+    0|normal) transform=0 ;;
+    90) transform=1 ;;
+    180) transform=2 ;;
+    270) transform=3 ;;
+    1|2|3|4|5|6|7) ;;
+    *) die "Usage: omarchy-displays transform <monitor> <0|90|180|270|0-7>" ;;
+  esac
+
+  layout_edit '
+    if (.outputs | has($n)) | not then error("Not a connected monitor: " + $n) else . end
+    | .outputs[$n].transform = ($t | tonumber)
+  ' --arg n "$name" --arg t "$transform"
+  notify "$name rotated"
+}
+
+cmd_position() {
+  local name="${1:-}" position="${2:-}"
+  require_output "$name"
+  if [[ $position == auto ]]; then
+    layout_edit '.outputs[$n].position = null' --arg n "$name"
+    notify "$name position back to automatic"
+    return
+  fi
+  [[ $position =~ ^-?[0-9]+x-?[0-9]+$ ]] \
+    || die "Usage: omarchy-displays position <monitor> <XxY|auto>"
+
+  layout_edit '
+    if (.outputs | has($n)) | not then error("Not a connected monitor: " + $n) else . end
+    | .outputs[$n].position = $p
+  ' --arg n "$name" --arg p "$position"
+  notify "$name at $position"
+}
+
+cmd_align() {
+  local align="${1:-top}"
+  case "$align" in
+    top|start) align=start ;;
+    center|middle) align=center ;;
+    bottom|end) align=end ;;
+    *) die "Usage: omarchy-displays align <top|center|bottom>" ;;
+  esac
+  layout_edit '.align = $a | .outputs |= with_entries(.value.position = null)' --arg a "$align"
+}
+
+cmd_primary() {
+  local name="${1:-}"
+  require_output "$name"
+  layout_edit '
+    if (.outputs | has($n)) | not then error("Not a connected monitor: " + $n) else . end
+    | .primary = $n
+  ' --arg n "$name"
+  # Hyprland has no primary concept; the plugin uses it as the arrangement
+  # anchor and parks workspace 1 there so new windows land on it.
+  hyprctl dispatch "hl.dsp.moveworkspacetomonitor({ workspace = \"1\", monitor = \"$name\" })" >/dev/null 2>&1 || true
+  notify "$name is primary"
+}
+
+# ----------------------------------------------------------------- profiles
+
+profile_path() {
+  local name="$1"
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Profile names may use letters, digits, dot, dash, underscore"
+  printf '%s/%s.json\n' "$PROFILE_DIR" "$name"
+}
+
+cmd_profile() {
+  local action="${1:-list}"; shift || true
+  case "$action" in
+    list)
+      [[ -d $PROFILE_DIR ]] || return 0
+      find "$PROFILE_DIR" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null |
+        sed 's/\.json$//' | sort
+      ;;
+    save)
+      local name="${1:-}"
+      [[ -n $name ]] || die "Usage: omarchy-displays profile save <name>"
+      local path
+      path=$(profile_path "$name")
+      mkdir -p "$PROFILE_DIR"
+      # The fingerprint is the set of outputs the profile was captured on, so
+      # `profile auto` can pick the one that matches what is plugged in now.
+      layout_load | jq --arg name "$name" --argjson fp "$(connected_names | jq -R . | jq -s .)" \
+        '. + { name: $name, fingerprint: $fp }' >"$path"
+      notify "Saved display profile \"$name\""
+      ;;
+    apply)
+      local name="${1:-}" next
+      [[ -n $name ]] || die "Usage: omarchy-displays profile apply <name>"
+      local path
+      path=$(profile_path "$name")
+      [[ -f $path ]] || die "No such profile: $name"
+      next=$(jq 'del(.name, .fingerprint)' "$path") || exit 1
+      layout_replace "$next"
+      apply
+      notify "Applied display profile \"$name\""
+      ;;
+    rm|remove|delete)
+      local name="${1:-}"
+      [[ -n $name ]] || die "Usage: omarchy-displays profile rm <name>"
+      rm -f "$(profile_path "$name")"
+      notify "Removed display profile \"$name\""
+      ;;
+    auto)
+      # Pick the profile whose fingerprint matches the connected outputs.
+      [[ -d $PROFILE_DIR ]] || return 0
+      local fp match
+      fp=$(connected_names | jq -R . | jq -s 'sort')
+      match=$(for f in "$PROFILE_DIR"/*.json; do
+        [[ -f $f ]] || continue
+        if jq -e --argjson fp "$fp" '(.fingerprint // [] | sort) == $fp' "$f" >/dev/null 2>&1; then
+          basename "$f" .json
+          break
+        fi
+      done)
+      [[ -n ${match:-} ]] || return 0
+      cmd_profile apply "$match"
+      ;;
+    *) die "Usage: omarchy-displays profile <list|save|apply|rm|auto> [name]" ;;
+  esac
+}
+
+# --------------------------------------------------------------------- main
+
+usage() {
+  cat <<'USAGE'
+omarchy-displays — multi-monitor and projector layout control
+
+  state                             Print panel state as JSON
+  render                            Print the Hyprland Lua this layout renders to
+  mirror [monitor]                  Mirror every enabled display from one source
+  extend <right|left|up|down>       Extend the desktop in that direction
+  arrange [--vertical] <mon>...     Place monitors in an explicit order
+  only <monitor>                    Enable just that monitor
+  enable <monitor> [on|off|toggle]  Enable or disable a monitor
+  mode <monitor> <WxH[@HZ]|preferred>
+  scale <monitor> <0.5-4>
+  transform <monitor> <0|90|180|270>
+  position <monitor> <XxY|auto>
+  align <top|center|bottom>         Cross-axis alignment for extended displays
+  primary <monitor>                 Arrangement anchor; parks workspace 1 there
+  profile <list|save|apply|rm|auto> [name]
+  apply                             Re-render and reload the current layout
+  reset                             Drop the generated config, back to monitors.lua
+USAGE
+}
+
+case "${1:-}" in
+  state) shift; cmd_state "$@" ;;
+  render) shift; cmd_render "$@" ;;
+  mirror) shift; cmd_mirror "$@" ;;
+  extend) shift; cmd_extend "$@" ;;
+  arrange) shift; cmd_arrange "$@" ;;
+  only) shift; cmd_only "$@" ;;
+  enable) shift; cmd_enable "$@" ;;
+  mode) shift; cmd_mode "$@" ;;
+  scale) shift; cmd_scale "$@" ;;
+  transform|rotate) shift; cmd_transform "$@" ;;
+  position) shift; cmd_position "$@" ;;
+  align) shift; cmd_align "$@" ;;
+  primary) shift; cmd_primary "$@" ;;
+  profile) shift; cmd_profile "$@" ;;
+  apply) shift; apply ;;
+  reset) shift; cmd_reset "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 1 ;;
+esac

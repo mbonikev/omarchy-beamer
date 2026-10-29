@@ -1,0 +1,3 @@
+#!/bin/bash
+# Swallow every compositor call so the engine can be exercised off-session.
+exit 0
